@@ -69,4 +69,25 @@ I will not reuse this code on another site without checking its rules and terms 
 - **Canonical Identity & Idempotency**: Uses `product_url` as the canonical record identity. Deduplicates entries to guarantee that rerunning the pipeline produces exactly 60 unique records in `output/books.json` without appending duplicates.
 - **Expected Result**: 60 valid, schema-compliant records in `output/books.json` and 0 errors in `output/errors.json`.
 
+## Stage 5: Per-Page Failure Isolation & Run Reporting
+
+- **Per-Page Failure Isolation**: Every book detail page is fetched and processed independently inside a try-except block. If an individual page fails to fetch or parse, the failure is logged to `stderr`, `failed_pages` is incremented, and processing immediately proceeds to remaining pages without crashing the entire run. All legitimate good records survive.
+- **Polite Retry Rules**:
+  - **Timeout / HTTP 5xx Errors**: Retried exactly ONCE after a brief 1.0 s delay.
+  - **HTTP 404 / 403 Errors**: Skipped immediately WITHOUT retry. A 404 indicates a non-existent URL and 403 indicates a server refusal; repeatedly requesting them violates polite scraping principles.
+- **Run Reporting (`output/run-report.json`)**: Generates an honest execution summary JSON file containing:
+  - `started_at`: ISO 8601 start timestamp
+  - `duration_seconds`: Total pipeline execution time in seconds
+  - `pages_fetched`: Count of real HTTP requests issued
+  - `cache_hits`: Count of responses loaded from local disk cache
+  - `valid_records`: Count of successfully validated records in `output/books.json`
+  - `invalid_records`: Count of records failing schema validation in `output/errors.json`
+  - `failed_pages`: Count of detail pages that failed to load/fetch
+- **Controlled Failure Testing**:
+  - The pipeline supports an opt-in CLI flag `--test-failure` (`python src/main.py --test-failure`).
+  - When `--test-failure` is specified, a deliberately fake book URL (`nonexistent-broken-book_99999/index.html`) is injected into the processing queue.
+  - The scraper detects the HTTP 404, logs the failure without retrying, records `failed_pages: 1` in `run-report.json`, and preserves all 60 legitimate records intact in `output/books.json`.
+- **Normal Run Behavior**: Standard execution (`python src/main.py`) processes only the 60 real book records, yielding `failed_pages: 0` and 60 records in `output/books.json`.
+
+
 

@@ -1,5 +1,5 @@
 """
-The Polite Scraper — Stage 4: Data Normalization & Schema Validation
+The Polite Scraper — Stage 5: Per-Page Failure Isolation & Run Reporting
 FlyRank Internship Backend AI Engineering Week 5 Assignment A9
 """
 
@@ -76,9 +76,82 @@ def get_book_cache_path(url: str) -> Path:
     return CACHE_DIR / "books" / f"{safe_name}.html"
 
 
+def fetch_with_retry(
+    url: str,
+    headers: dict,
+    timeout: float,
+    last_fetch_time: list[float],
+    metrics: dict,
+) -> tuple[str, int]:
+    """
+    Executes HTTP GET request with rate limiting and 1 retry on timeout or HTTP 5xx errors.
+    Does NOT retry on 404 or 403.
+    """
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        if last_fetch_time[0] > 0:
+            elapsed = time.time() - last_fetch_time[0]
+            if elapsed < MIN_REQUEST_DELAY:
+                time.sleep(MIN_REQUEST_DELAY - elapsed)
+
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            last_fetch_time[0] = time.time()
+            metrics["pages_fetched"] += 1
+
+            status = response.status_code
+            if status == 200:
+                return response.text, 200
+
+            if status in (404, 403):
+                print(
+                    f"HTTP {status} for {url} - skipping without retry.",
+                    file=sys.stderr,
+                )
+                return "", status
+
+            if status >= 500:
+                if attempt < max_attempts:
+                    print(
+                        f"HTTP {status} on {url}. Retrying (attempt 2/2)...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(1.0)
+                    continue
+                else:
+                    print(
+                        f"HTTP {status} on {url} after retry. Failing page.",
+                        file=sys.stderr,
+                    )
+                    return "", status
+
+            return "", status
+
+        except requests.exceptions.Timeout as e:
+            print(f"Timeout on {url} (attempt {attempt}/2): {e}", file=sys.stderr)
+            if attempt < max_attempts:
+                time.sleep(1.0)
+                continue
+            else:
+                return "", 0
+        except requests.exceptions.RequestException as e:
+            print(
+                f"Request exception on {url} (attempt {attempt}/2): {e}",
+                file=sys.stderr,
+            )
+            if attempt < max_attempts:
+                time.sleep(1.0)
+                continue
+            else:
+                return "", 0
+
+    return "", 0
+
+
 def fetch_or_load_catalogue_page(
     url: str,
     last_fetch_time: list[float],
+    metrics: dict,
     user_agent: str = USER_AGENT,
     timeout: float = REQUEST_TIMEOUT,
 ) -> str:
@@ -87,36 +160,32 @@ def fetch_or_load_catalogue_page(
 
     if cache_path.exists() and cache_path.stat().st_size > 0:
         html_content = cache_path.read_text(encoding="utf-8")
+        metrics["cache_hits"] += 1
         rel_cache_path = cache_path.relative_to(SCRAPER_DIR)
         print(
             f"CACHE HIT: Loaded {url} from {rel_cache_path} ({len(html_content.encode('utf-8'))} bytes)"
         )
         return html_content
 
-    if last_fetch_time[0] > 0:
-        elapsed = time.time() - last_fetch_time[0]
-        if elapsed < MIN_REQUEST_DELAY:
-            time.sleep(MIN_REQUEST_DELAY - elapsed)
-
     headers = {"User-Agent": user_agent}
-    response = requests.get(url, headers=headers, timeout=timeout)
-    last_fetch_time[0] = time.time()
+    html_content, status = fetch_with_retry(
+        url, headers, timeout, last_fetch_time, metrics
+    )
 
-    if response.status_code != 200:
+    if status != 200:
         print(
-            f"ERROR: Expected HTTP 200, got status code {response.status_code} for URL: {url}",
+            f"ERROR: Expected HTTP 200, got status code {status} for URL: {url}",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    html_content = response.text
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(html_content, encoding="utf-8")
 
     rel_cache_path = cache_path.relative_to(SCRAPER_DIR)
     content_bytes = len(html_content.encode("utf-8"))
     print(
-        f"FETCH: Requested {url} [HTTP {response.status_code}] -> Saved to {rel_cache_path} ({content_bytes} bytes)"
+        f"FETCH: Requested {url} [HTTP {status}] -> Saved to {rel_cache_path} ({content_bytes} bytes)"
     )
 
     return html_content
@@ -131,7 +200,7 @@ def extract_next_page_url(html_content: str, base_url: str) -> str | None:
     return None
 
 
-def discover_catalogue_book_items() -> list[dict[str, str]]:
+def discover_catalogue_book_items(metrics: dict) -> list[dict[str, str]]:
     """Discovers unique book items from MAX_PAGES catalogue pages with source_page provenance."""
     current_url = START_URL
     discovered_items: list[dict[str, str]] = []
@@ -139,7 +208,9 @@ def discover_catalogue_book_items() -> list[dict[str, str]]:
     last_fetch_time = [0.0]
 
     while current_url and pages_processed < MAX_PAGES:
-        html_content = fetch_or_load_catalogue_page(current_url, last_fetch_time)
+        html_content = fetch_or_load_catalogue_page(
+            current_url, last_fetch_time, metrics
+        )
         pages_processed += 1
 
         soup = BeautifulSoup(html_content, "html.parser")
@@ -156,7 +227,6 @@ def discover_catalogue_book_items() -> list[dict[str, str]]:
         else:
             break
 
-    # Deduplicate by product_url while preserving order and provenance
     seen_urls = set()
     unique_items = []
     for item in discovered_items:
@@ -170,17 +240,19 @@ def discover_catalogue_book_items() -> list[dict[str, str]]:
 def fetch_or_load_book_page(
     url: str,
     last_fetch_time: list[float],
+    metrics: dict,
     user_agent: str = USER_AGENT,
     timeout: float = REQUEST_TIMEOUT,
-) -> tuple[str, str]:
+) -> tuple[str, str] | None:
     """
     Fetches the HTML page for a book detail page or returns cached HTML.
-    Returns (html_content, fetched_at_iso_string).
+    Returns (html_content, fetched_at_iso_string) or None if request failed.
     """
     cache_path = get_book_cache_path(url)
 
     if cache_path.exists() and cache_path.stat().st_size > 0:
         html_content = cache_path.read_text(encoding="utf-8")
+        metrics["cache_hits"] += 1
         mtime = cache_path.stat().st_mtime
         fetched_at = datetime.fromtimestamp(mtime, timezone.utc).isoformat()
         rel_cache_path = cache_path.relative_to(SCRAPER_DIR)
@@ -189,21 +261,19 @@ def fetch_or_load_book_page(
         )
         return html_content, fetched_at
 
-    if last_fetch_time[0] > 0:
-        elapsed = time.time() - last_fetch_time[0]
-        if elapsed < MIN_REQUEST_DELAY:
-            time.sleep(MIN_REQUEST_DELAY - elapsed)
-
     headers = {"User-Agent": user_agent}
-    response = requests.get(url, headers=headers, timeout=timeout)
-    last_fetch_time[0] = time.time()
+    html_content, status = fetch_with_retry(
+        url, headers, timeout, last_fetch_time, metrics
+    )
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Expected HTTP 200, got status code {response.status_code} for URL: {url}"
+    if status != 200:
+        metrics["failed_pages"] += 1
+        print(
+            f"PAGE FAILED: Could not fetch detail page for {url} [HTTP {status}]",
+            file=sys.stderr,
         )
+        return None
 
-    html_content = response.text
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(html_content, encoding="utf-8")
 
@@ -211,7 +281,7 @@ def fetch_or_load_book_page(
     rel_cache_path = cache_path.relative_to(SCRAPER_DIR)
     content_bytes = len(html_content.encode("utf-8"))
     print(
-        f"FETCH: Requested detail page {url} [HTTP {response.status_code}] -> Saved to {rel_cache_path} ({content_bytes} bytes)"
+        f"FETCH: Requested detail page {url} [HTTP {status}] -> Saved to {rel_cache_path} ({content_bytes} bytes)"
     )
 
     return html_content, fetched_at
@@ -258,9 +328,21 @@ def parse_book_detail_page(
     }
 
 
-def process_and_validate_records() -> tuple[list[dict], list[dict]]:
+def process_and_validate_records(
+    metrics: dict, inject_failure: bool = False
+) -> tuple[list[dict], list[dict]]:
     """Fetches, normalizes, and validates all book records."""
-    book_items = discover_catalogue_book_items()
+    book_items = discover_catalogue_book_items(metrics)
+
+    if inject_failure:
+        fake_item = {
+            "product_url": (
+                "https://books.toscrape.com/catalogue/nonexistent-broken-book_99999/index.html"
+            ),
+            "source_page": "https://books.toscrape.com/catalogue/page-1.html",
+        }
+        book_items.append(fake_item)
+
     valid_records: list[dict] = []
     invalid_records: list[dict] = []
     last_fetch_time = [0.0]
@@ -269,18 +351,18 @@ def process_and_validate_records() -> tuple[list[dict], list[dict]]:
         product_url = item["product_url"]
         source_page = item["source_page"]
         try:
-            html_content, fetched_at = fetch_or_load_book_page(
-                product_url, last_fetch_time
-            )
+            result = fetch_or_load_book_page(product_url, last_fetch_time, metrics)
+            if result is None:
+                continue
+
+            html_content, fetched_at = result
             raw_record = parse_book_detail_page(
                 html_content, product_url, source_page, fetched_at
             )
 
-            # Stage 4: Normalize price_text -> price_gbp
             price_gbp = normalize_price(raw_record["price_text"])
             record_to_validate = {**raw_record, "price_gbp": price_gbp}
 
-            # Stage 4: Validate against Pydantic schema
             validated_model = BookRecord(**record_to_validate)
             valid_records.append(validated_model.model_dump())
 
@@ -293,7 +375,6 @@ def process_and_validate_records() -> tuple[list[dict], list[dict]]:
             }
             invalid_records.append(invalid_entry)
 
-    # Deduplicate valid records by canonical product_url (idempotency)
     seen_urls = set()
     unique_valid_records = []
     for rec in valid_records:
@@ -304,9 +385,27 @@ def process_and_validate_records() -> tuple[list[dict], list[dict]]:
     return unique_valid_records, invalid_records
 
 
-def run_stage4_pipeline() -> None:
-    """Executes Stage 4: extraction, normalization, validation, and output generation."""
-    valid_records, invalid_records = process_and_validate_records()
+def run_stage5_pipeline(inject_failure: bool = False) -> dict:
+    """Executes Stage 5: extraction, validation, reporting, and output generation."""
+    start_time = datetime.now(timezone.utc)
+
+    metrics = {
+        "pages_fetched": 0,
+        "cache_hits": 0,
+        "valid_records": 0,
+        "invalid_records": 0,
+        "failed_pages": 0,
+    }
+
+    valid_records, invalid_records = process_and_validate_records(
+        metrics, inject_failure=inject_failure
+    )
+
+    end_time = datetime.now(timezone.utc)
+    duration = round((end_time - start_time).total_seconds(), 2)
+
+    metrics["valid_records"] = len(valid_records)
+    metrics["invalid_records"] = len(invalid_records)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -322,21 +421,37 @@ def run_stage4_pipeline() -> None:
         json.dumps(invalid_records, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
-    valid_count = len(valid_records)
-    invalid_count = len(invalid_records)
+    # Write output/run-report.json
+    run_report = {
+        "started_at": start_time.isoformat(),
+        "duration_seconds": duration,
+        "pages_fetched": metrics["pages_fetched"],
+        "cache_hits": metrics["cache_hits"],
+        "valid_records": metrics["valid_records"],
+        "invalid_records": metrics["invalid_records"],
+        "failed_pages": metrics["failed_pages"],
+    }
+    report_file = OUTPUT_DIR / "run-report.json"
+    report_file.write_text(
+        json.dumps(run_report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    valid_count = metrics["valid_records"]
+    invalid_count = metrics["invalid_records"]
     unique_count = len({r["product_url"] for r in valid_records})
+    failed_count = metrics["failed_pages"]
 
     print(f"\nvalid_records={valid_count}")
     print(f"invalid_records={invalid_count}")
     print(f"unique_records={unique_count}")
+    print(f"failed_pages={failed_count}")
 
-    if valid_records:
-        print("\nSample Validated Record (1 of 60):")
-        print(json.dumps(valid_records[0], indent=2, ensure_ascii=False))
+    return run_report
 
 
 def main() -> None:
-    run_stage4_pipeline()
+    inject_failure = "--test-failure" in sys.argv
+    run_stage5_pipeline(inject_failure=inject_failure)
 
 
 if __name__ == "__main__":
