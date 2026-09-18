@@ -23,3 +23,16 @@ This repository contains a polite web scraper built for the FlyRank Internship B
 ## Responsible Scraping Commitment
 I will not reuse this code on another site without checking its rules and terms first.
 
+## Stage 1: Polite Fetch & Cache
+
+- **Target Page**: `https://books.toscrape.com/catalogue/page-1.html`
+- **Identifying User-Agent**: `FlyRankInternship-A9/1.0 (+https://github.com/Priyanshu1877/WEEK4EmptybutLive)`
+- **Request Timeout**: 10.0 seconds to prevent hanging requests.
+- **HTTP 200 Requirement**: Only HTTP status code 200 is accepted as a successful response before proceeding to save or parse.
+- **Cache Location**: `scraper/cache/catalogue-page-1.html`
+- **Cache Behavior**:
+  - **First Run (Cache Miss)**: Issues an HTTP GET request, prints `FETCH ...`, verifies HTTP 200, and writes the response HTML to disk.
+  - **Subsequent Runs (Cache Hit)**: Detects existing cache file, bypasses network requests completely, prints `CACHE HIT ...`, and loads HTML from disk.
+- **Why Caching Matters**: Local caching prevents unnecessary network traffic and avoids placing repetitive load on target servers during development, debugging, and testing iterations.
+
+
