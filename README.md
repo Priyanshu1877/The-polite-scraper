@@ -60,3 +60,13 @@ I will not reuse this code on another site without checking its rules and terms 
 - **Detail-Page Caching**: Caches each fetched detail page locally under `cache/books/<safe-book-cache-name>.html`. Subsequent runs read directly from cache without hitting the live site.
 - **Polite Fetching Rules**: Enforces identifying `User-Agent`, 10.0 s timeout, HTTP 200 validation, and minimum 500 ms delay between real network requests.
 
+## Stage 4: Data Normalization & Schema Validation
+
+- **Price Normalization (`price_text` → `price_gbp`)**: Normalizes raw price text (`£51.77`) into a numeric float (`51.77`) stored under `price_gbp`.
+- **Why Original `price_text` is Retained**: Retaining the unparsed raw `price_text` alongside `price_gbp` preserves raw source data auditability and provenance, ensuring original formatting is never lost.
+- **Pydantic Schema Validation**: Every record is validated against a strict Pydantic `BookRecord` model defining explicit field types, requiring absolute HTTPS URLs for `product_url` and `source_page`, numeric `price_gbp`, ISO 8601 timestamps for `fetched_at`, and nullable `description`.
+- **Output Routing**: Validated records are routed to `output/books.json`. Any record failing validation is recorded in `output/errors.json` with timestamp and error details (an empty `[]` array when 100% valid).
+- **Canonical Identity & Idempotency**: Uses `product_url` as the canonical record identity. Deduplicates entries to guarantee that rerunning the pipeline produces exactly 60 unique records in `output/books.json` without appending duplicates.
+- **Expected Result**: 60 valid, schema-compliant records in `output/books.json` and 0 errors in `output/errors.json`.
+
+

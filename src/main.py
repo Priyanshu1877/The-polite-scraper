@@ -1,15 +1,17 @@
 """
-The Polite Scraper — Stage 3: Raw Detail Extraction
+The Polite Scraper — Stage 4: Data Normalization & Schema Validation
 FlyRank Internship Backend AI Engineering Week 5 Assignment A9
 """
 
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import sys
 import time
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, ValidationError, field_validator
 import requests
 
 # Configuration
@@ -24,6 +26,37 @@ MAX_PAGES = 3
 # Resolve paths relative to scraper directory
 SCRAPER_DIR = Path(__file__).resolve().parent.parent
 CACHE_DIR = SCRAPER_DIR / "cache"
+OUTPUT_DIR = SCRAPER_DIR / "output"
+
+
+class BookRecord(BaseModel):
+    """Pydantic schema for a normalized and validated book record."""
+
+    title: str
+    product_url: str
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str
+    description: str | None = None
+    source_page: str
+    fetched_at: str
+
+    @field_validator("product_url", "source_page")
+    @classmethod
+    def validate_https_url(cls, v: str) -> str:
+        """Validates that URLs are absolute HTTPS URLs."""
+        if not v.startswith("https://"):
+            raise ValueError(f"URL must be an absolute HTTPS URL, got: {v}")
+        return v
+
+
+def normalize_price(price_text: str) -> float:
+    """Extracts numeric price float from raw price_text (e.g. '£51.77' -> 51.77)."""
+    match = re.search(r"(\d+\.\d+|\d+)", price_text)
+    if match:
+        return float(match.group(1))
+    raise ValueError(f"Unable to parse numeric price from price_text: {price_text!r}")
 
 
 def get_catalogue_cache_path(url: str) -> Path:
@@ -187,22 +220,18 @@ def fetch_or_load_book_page(
 def parse_book_detail_page(
     html_content: str, product_url: str, source_page: str, fetched_at: str
 ) -> dict:
-    """Parses a book detail page HTML and extracts the required raw record fields."""
+    """Parses a book detail page HTML and extracts raw record fields."""
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # Title
     title_elem = soup.select_one(".product_main h1")
     title = title_elem.text.strip() if title_elem else ""
 
-    # Price text (preserve original raw text)
     price_elem = soup.select_one(".product_main .price_color")
     price_text = price_elem.text.strip() if price_elem else ""
 
-    # Availability text (preserve original raw text)
     avail_elem = soup.select_one(".product_main .availability")
     availability_text = " ".join(avail_elem.text.split()) if avail_elem else ""
 
-    # Rating text (preserve original class name representation)
     rating_elem = soup.select_one(".product_main .star-rating")
     rating_text = ""
     if rating_elem and rating_elem.get("class"):
@@ -210,7 +239,6 @@ def parse_book_detail_page(
         if classes:
             rating_text = classes[0]
 
-    # Description (null if missing)
     desc_header = soup.select_one("#product_description")
     description = None
     if desc_header:
@@ -230,10 +258,11 @@ def parse_book_detail_page(
     }
 
 
-def run_stage3_extraction() -> list[dict]:
-    """Performs Stage 3 raw detail extraction for all discovered books."""
+def process_and_validate_records() -> tuple[list[dict], list[dict]]:
+    """Fetches, normalizes, and validates all book records."""
     book_items = discover_catalogue_book_items()
-    raw_records = []
+    valid_records: list[dict] = []
+    invalid_records: list[dict] = []
     last_fetch_time = [0.0]
 
     for idx, item in enumerate(book_items, start=1):
@@ -243,26 +272,71 @@ def run_stage3_extraction() -> list[dict]:
             html_content, fetched_at = fetch_or_load_book_page(
                 product_url, last_fetch_time
             )
-            record = parse_book_detail_page(
+            raw_record = parse_book_detail_page(
                 html_content, product_url, source_page, fetched_at
             )
-            raw_records.append(record)
-        except Exception as e:
-            print(
-                f"ERROR: Failed to process book {idx} at {product_url}: {e}",
-                file=sys.stderr,
-            )
 
-    if raw_records:
-        print("\nSample Raw Record (1 of 60):")
-        print(json.dumps(raw_records[0], indent=2, ensure_ascii=False))
+            # Stage 4: Normalize price_text -> price_gbp
+            price_gbp = normalize_price(raw_record["price_text"])
+            record_to_validate = {**raw_record, "price_gbp": price_gbp}
 
-    print(f"\ndetail_pages={len(raw_records)}")
-    return raw_records
+            # Stage 4: Validate against Pydantic schema
+            validated_model = BookRecord(**record_to_validate)
+            valid_records.append(validated_model.model_dump())
+
+        except (ValidationError, Exception) as e:
+            invalid_entry = {
+                "product_url": product_url,
+                "source_page": source_page,
+                "error": str(e),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            invalid_records.append(invalid_entry)
+
+    # Deduplicate valid records by canonical product_url (idempotency)
+    seen_urls = set()
+    unique_valid_records = []
+    for rec in valid_records:
+        if rec["product_url"] not in seen_urls:
+            seen_urls.add(rec["product_url"])
+            unique_valid_records.append(rec)
+
+    return unique_valid_records, invalid_records
+
+
+def run_stage4_pipeline() -> None:
+    """Executes Stage 4: extraction, normalization, validation, and output generation."""
+    valid_records, invalid_records = process_and_validate_records()
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Write output/books.json
+    books_file = OUTPUT_DIR / "books.json"
+    books_file.write_text(
+        json.dumps(valid_records, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # Write output/errors.json
+    errors_file = OUTPUT_DIR / "errors.json"
+    errors_file.write_text(
+        json.dumps(invalid_records, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    valid_count = len(valid_records)
+    invalid_count = len(invalid_records)
+    unique_count = len({r["product_url"] for r in valid_records})
+
+    print(f"\nvalid_records={valid_count}")
+    print(f"invalid_records={invalid_count}")
+    print(f"unique_records={unique_count}")
+
+    if valid_records:
+        print("\nSample Validated Record (1 of 60):")
+        print(json.dumps(valid_records[0], indent=2, ensure_ascii=False))
 
 
 def main() -> None:
-    run_stage3_extraction()
+    run_stage4_pipeline()
 
 
 if __name__ == "__main__":
