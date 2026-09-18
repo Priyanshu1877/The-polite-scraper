@@ -43,3 +43,20 @@ I will not reuse this code on another site without checking its rules and terms 
 - **Duplicate Removal**: Cleans and deduplicates discovered book URLs using order-preserving dictionary lookup (`dict.fromkeys()`).
 - **Catalogue-Page Caching**: Caches each catalogue page locally (`catalogue-page-1.html`, `catalogue-page-2.html`, `catalogue-page-3.html`). On subsequent runs, network requests are completely bypassed by reading from disk.
 - **Rate Limiting**: Enforces a minimum 500 ms delay (`time.sleep(0.5)`) between consecutive real network requests, maintaining identifying `User-Agent` headers and a 10.0-second timeout.
+
+## Stage 3: Raw Detail Extraction
+
+- **Detail-Page Discovery Source**: Processes all 60 unique book detail page URLs discovered directly from the 3 catalogue pages in Stage 2. No book URLs are hardcoded.
+- **Eight Raw Fields**: Extracts exactly eight raw fields for each book detail page:
+  1. `title`: Clean book title string from `.product_main h1`.
+  2. `product_url`: Absolute HTTPS URL discovered in Stage 2.
+  3. `price_text`: Preserved original displayed price text (e.g., `£51.77`). Remains unparsed raw text; price normalization belongs strictly to Stage 4.
+  4. `availability_text`: Preserved original raw availability string (e.g., `In stock (22 available)`).
+  5. `rating_text`: Preserved original rating class representation (e.g., `Three`).
+  6. `description`: Extracted text from `#product_description + p`. Returns `null` if a book has no description (never invents or substitutes text).
+  7. `source_page`: Exact catalogue page URL from which the book was discovered, providing full data provenance.
+  8. `fetched_at`: ISO 8601 timestamp recording when the detail page HTML was fetched/loaded.
+- **Selector Rules**: Targeted specifically at the `.product_main` product container and explicit element IDs rather than generic page-wide text matching.
+- **Detail-Page Caching**: Caches each fetched detail page locally under `cache/books/<safe-book-cache-name>.html`. Subsequent runs read directly from cache without hitting the live site.
+- **Polite Fetching Rules**: Enforces identifying `User-Agent`, 10.0 s timeout, HTTP 200 validation, and minimum 500 ms delay between real network requests.
+
