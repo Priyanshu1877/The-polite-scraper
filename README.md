@@ -35,4 +35,11 @@ I will not reuse this code on another site without checking its rules and terms 
   - **Subsequent Runs (Cache Hit)**: Detects existing cache file, bypasses network requests completely, prints `CACHE HIT ...`, and loads HTML from disk.
 - **Why Caching Matters**: Local caching prevents unnecessary network traffic and avoids placing repetitive load on target servers during development, debugging, and testing iterations.
 
+## Stage 2: Catalogue Link Discovery
 
+- **Catalogue Discovery**: Discovers all book detail page URLs across exactly the first 3 catalogue pages starting from `https://books.toscrape.com/catalogue/page-1.html`.
+- **Following Next Link**: Navigates dynamically from page to page by parsing the HTML with Beautiful Soup and following the site's own `<li class="next"><a href="...">` pagination element rather than constructing or hardcoding page URLs.
+- **Relative to Absolute URL Conversion**: Converts relative product URLs (`a-light-in-the-attic_1000/index.html`) into absolute HTTPS URLs using `urllib.parse.urljoin` without manual string concatenation.
+- **Duplicate Removal**: Cleans and deduplicates discovered book URLs using order-preserving dictionary lookup (`dict.fromkeys()`).
+- **Catalogue-Page Caching**: Caches each catalogue page locally (`catalogue-page-1.html`, `catalogue-page-2.html`, `catalogue-page-3.html`). On subsequent runs, network requests are completely bypassed by reading from disk.
+- **Rate Limiting**: Enforces a minimum 500 ms delay (`time.sleep(0.5)`) between consecutive real network requests, maintaining identifying `User-Agent` headers and a 10.0-second timeout.
